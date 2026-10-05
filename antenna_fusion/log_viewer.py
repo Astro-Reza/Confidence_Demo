@@ -2,7 +2,7 @@
 Interactive Sensor Fusion CSV Viewer
 ====================================
 GUI application to inspect, pan, zoom, and drag time windows across time-series
-data exported from `development.ipynb` (or `csv_logger.py`).
+data exported from `notebooks/fusion_development.ipynb` (via `csv_export.py`).
 
 Features:
 - Multi-plot layout:
@@ -15,15 +15,14 @@ Features:
 - Preset time window buttons (0-5s, 5-10s, Fit All, and "Jump to Glitch/Drift")
 - Curve visibility toggles (show/hide individual sensors)
 - Summary statistics card (RMSE, Max Error, % improvement)
-- File picker dialog & auto-load latest CSV in directory
+- File picker dialog & auto-load latest CSV in logs/
 
 Usage:
-    python csv_viewer.py [optional_path_to_file.csv]
+    python -m antenna_fusion.log_viewer [optional_path_to_file.csv]   (or run_log_viewer.bat)
 """
 
 import os
 import sys
-import glob
 import numpy as np
 import pandas as pd
 
@@ -36,6 +35,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QColor, QPalette
 import pyqtgraph as pg
+
+from .paths import LOGS_DIR, TIMESERIES_PATTERN, find_latest_log
 
 # Configure PyQtGraph dark theme & antialiasing
 pg.setConfigOption('background', '#0f172a')  # Slate 900
@@ -64,7 +65,7 @@ COLORS = {
 class CSVViewerWindow(QMainWindow):
     def __init__(self, initial_csv=None):
         super().__init__()
-        self.setWindowTitle("Sensor Fusion Timeseries Viewer — development.ipynb")
+        self.setWindowTitle("Sensor Fusion Timeseries Viewer")
         self.resize(1360, 880)
 
         self.df = None
@@ -621,7 +622,7 @@ class CSVViewerWindow(QMainWindow):
 
     def _on_open_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Simulation CSV", "", "CSV Files (*.csv);;All Files (*)"
+            self, "Open Simulation CSV", LOGS_DIR, "CSV Files (*.csv);;All Files (*)"
         )
         if path:
             self.load_csv(path)
@@ -635,14 +636,8 @@ class CSVViewerWindow(QMainWindow):
                 self.load_csv(latest)
 
     def _find_latest_csv(self):
-        """Find the newest sim_timeseries_*.csv file in the directory."""
-        candidates = glob.glob("sim_timeseries_*.csv")
-        if not candidates:
-            candidates = glob.glob("*.csv")
-        if candidates:
-            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return candidates[0]
-        return None
+        """Find the newest sim_timeseries_*.csv (else any CSV) in logs/."""
+        return find_latest_log(TIMESERIES_PATTERN, '*.csv')
 
     # ─────────────────────────────────────────────────────────────────────────
     # STYLESHEET HELPERS

@@ -6,11 +6,11 @@ Implements:
    kinematics transformation matrices for 3D STL mesh assembly.
 2. Dual Motion Models:
    - Target Chasing (Cascade PID with motor plant, friction, and gravity load factor)
-   - Brownian Random Motion with damping and reflective mechanical boundaries (from `development.ipynb`)
+   - Brownian Random Motion with damping and reflective mechanical boundaries (from `notebooks/fusion_development.ipynb`)
 3. Real-Time Sensor Modeling with dynamic noise and fault injection:
    - Encoder: base Gaussian noise σ_enc, drift ramp, and electrical glitch offset
    - AHRS: base Gaussian noise σ_ahrs (zero drift)
-4. Real-Time Causal Confidence-Score Quaternion Fusion (from `development.ipynb`):
+4. Real-Time Causal Confidence-Score Quaternion Fusion (from `notebooks/fusion_development.ipynb`):
    - Sliding window detrended variance calculation (isolates noise from physical motion)
    - Cross-sensor divergence trend filter and drift penalty
    - Inverse variance weighting and normalized confidence weights
@@ -26,14 +26,16 @@ from datetime import datetime
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from .paths import CAD_DIR, LOGS_DIR
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KINEMATICS & AXES CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 STL_FILES = {
-    'azimuth':      'CADs-Azimuth-Body.stl',
-    'elevation':    'CADs-Elevation-Body.stl',
-    'polarization': 'CADs-Polarization-Body.stl',
+    'azimuth':      os.path.join(CAD_DIR, 'azimuth_body.stl'),
+    'elevation':    os.path.join(CAD_DIR, 'elevation_body.stl'),
+    'polarization': os.path.join(CAD_DIR, 'polarization_body.stl'),
 }
 
 LINKS_CONFIG = {
@@ -57,7 +59,7 @@ AX_COLORS = {
 }
 
 BASE_STALL  = 28.0      # stall PWM at 0° elevation
-K_MOTOR     = 0.013     # (°/s) per (PWM – stall) per load_factor
+K_MOTOR     = 0.060     # (°/s) per (PWM – stall) per load_factor (responsive slew response)
 K_FRICTION  = 0.22      # velocity-proportional friction
 STATIC_FRIC = 0.04      # static friction
 
@@ -108,8 +110,67 @@ def load_factor(name: str, el_deg: float) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CASCADE PID & STALL DETECTOR (Plant Dynamics)
+# CASCADE CONTROL SYSTEM & STALL DETECTOR (Plant Dynamics)
 # ─────────────────────────────────────────────────────────────────────────────
+class CascadeOuterLoop:
+    """
+    Cascade Outer Loop: Position Error -> Demanded Rate of Change (Velocity Demand).
+    Generates high demanded rate of change when far from target (fast, responsive initial slew),
+    and progressively reduces rate of change as the antenna approaches the target angle
+    ('slower and slower') via kinematic deceleration profiling to prevent overshoot.
+    """
+    def __init__(self, v_max: float = 16.0, a_profile: float = 1.1, k_pos: float = 0.75):
+        self.v_max = v_max
+        self.a_profile = a_profile
+        self.k_pos = k_pos
+        self.kp = k_pos
+        self.ki = 0.0
+        self.kd = 0.0
+        self.d_crit = (2.0 * self.a_profile) / (self.k_pos ** 2)
+        self.prev_err = 0.0
+
+    def compute(self, pos_err: float, dt: float) -> float:
+        dist = abs(pos_err)
+        if dist > self.d_crit:
+            # Kinematic smooth deceleration curve: v = sqrt(2 * a * dist)
+            v_profile = math.sqrt(2.0 * self.a_profile * dist)
+        else:
+            # Exponential smooth arrival: perfectly critically damped, zero overshoot
+            v_profile = self.k_pos * dist
+
+        dem_speed = min(self.v_max, v_profile)
+        self.prev_err = pos_err
+        return float(math.copysign(dem_speed, pos_err))
+
+    def reset(self):
+        self.prev_err = 0.0
+
+
+class CascadeInnerLoop:
+    """
+    Cascade Inner Loop: Rate of Change -> Actuator PWM.
+    Dynamically adjusts motor PWM based on rate of change:
+    - Provides velocity feedforward to break stiction and sustain commanded rate.
+    - Applies closed-loop rate error feedback (proportional-derivative).
+    - As rate-of-change demand decreases, PWM reduces toward stall/zero levels,
+      with active counter-torque / braking when decelerating into target lock.
+    """
+    def __init__(self, kp: float = 14.0, kd: float = 0.30):
+        self.kp = kp
+        self.ki = 0.0
+        self.kd = kd
+        self.prev_rate_err = 0.0
+
+    def compute(self, rate_err: float, dt: float) -> float:
+        rate_deriv = (rate_err - self.prev_rate_err) / max(dt, 1e-9)
+        self.prev_rate_err = rate_err
+        fb = self.kp * rate_err + self.kd * rate_deriv
+        return float(fb)
+
+    def reset(self):
+        self.prev_rate_err = 0.0
+
+
 class PID:
     def __init__(self, kp: float, ki: float, kd: float, lo: float, hi: float):
         self.kp, self.ki, self.kd = kp, ki, kd
@@ -162,7 +223,7 @@ class StallDetector:
 # ─────────────────────────────────────────────────────────────────────────────
 class ConfidenceFusionEngine:
     """
-    Confidence-score based sensor fusion adapted from `development.ipynb`.
+    Confidence-score based sensor fusion adapted from `notebooks/fusion_development.ipynb`.
     Maintains a rolling causal buffer to calculate:
       1. Detrended rolling variance for each sensor (isolating noise from physical motion)
       2. Cross-sensor divergence trend (low-pass filter)
@@ -290,10 +351,10 @@ class AxisSimulation:
       - Dynamic sensor noise (σ_enc, σ_ahrs)
       - Interactive fault injection: continuous drift ramp & glitch step offset
     """
-    OUTER_KP, OUTER_KI, OUTER_KD = 2.8, 0.04, 1.1
-    OUTER_LO, OUTER_HI           = -20., 20.
+    OUTER_KP, OUTER_KI, OUTER_KD = 0.75, 0.0, 0.0
+    OUTER_LO, OUTER_HI           = -16., 16.
 
-    INNER_KP, INNER_KI, INNER_KD = 1.05, 1.9, 0.09
+    INNER_KP, INNER_KI, INNER_KD = 14.0, 0.0, 0.30
     INNER_LO, INNER_HI           = 0., 100.
 
     def __init__(self, name: str, dt: float = 0.02):
@@ -312,9 +373,9 @@ class AxisSimulation:
         self.brownian_alpha = 0.998
         self.brownian_sigma = 3.5
 
-        # Motor / PID control
-        self.outer = PID(self.OUTER_KP, self.OUTER_KI, self.OUTER_KD, self.OUTER_LO, self.OUTER_HI)
-        self.inner = PID(self.INNER_KP, self.INNER_KI, self.INNER_KD, self.INNER_LO, self.INNER_HI)
+        # Motor / Cascade Control
+        self.outer = CascadeOuterLoop(v_max=16.0, a_profile=1.1, k_pos=0.75)
+        self.inner = CascadeInnerLoop(kp=14.0, kd=0.30)
         self.stall = StallDetector()
         self.vel_demand = 0.0
         self.pwm = 0.0
@@ -378,7 +439,7 @@ class AxisSimulation:
 
         # ── 1. True Motion Update ──────────────────────────────────────────
         if self.motion_mode == 'BROWNIAN':
-            # Brownian motion with damping & reflective boundaries (development.ipynb)
+            # Brownian motion with damping & reflective boundaries (fusion_development.ipynb)
             d_omega = random.gauss(0.0, self.brownian_sigma) * math.sqrt(dt) * sim_speed
             self.true_vel = self.true_vel * self.brownian_alpha + d_omega
             new_angle = self.true_angle + self.true_vel * dt
@@ -396,34 +457,59 @@ class AxisSimulation:
             self.phase = 'BROWNIAN'
 
         else:
-            # Target Chasing with Motor & Friction Plant (Cascade PID)
+            # Target Chasing with Motor & Friction Plant (Cascade Control)
             lf = load_factor(self.name, el_deg)
             stall_pwm = BASE_STALL * lf
 
             pos_err = self.target - self.true_angle
-            if abs(pos_err) < 0.15 and abs(self.true_vel) < 0.1:
+            dist = abs(pos_err)
+
+            if dist < 0.15 and abs(self.true_vel) < 0.15:
                 self.phase = 'HOLDING'
                 self.true_vel = 0.0
                 self.pwm = 0.0
                 self.vel_demand = 0.0
+                self.roc_err = 0.0
+                self.stall.update(0.0, 0.0)
             else:
                 self.phase = 'TRACKING'
+                # 1. Outer Loop: Position error -> Demanded Rate of Change
+                # Moves fast initially, then tapers smoothly as it nears target ('slower and slower')
                 self.vel_demand = self.outer.compute(pos_err, dt)
-                self.roc_err = abs(self.vel_demand) - abs(self.true_vel)
-                raw_pwm = self.inner.compute(self.roc_err, dt)
 
+                # Rate tracking error (signed) & rate-of-change error (magnitude)
+                rate_err = self.vel_demand - self.true_vel
+                self.roc_err = abs(self.vel_demand) - abs(self.true_vel)
+
+                # 2. Inner Loop: Rate of change -> PWM adjustment
+                # Feedforward effort to overcome friction at demanded rate-of-change
+                ff_req_force = (K_FRICTION * self.vel_demand + STATIC_FRIC * math.copysign(1.0, self.vel_demand)) if abs(self.vel_demand) > 0.02 else 0.0
+                ff_effort = ff_req_force / (K_MOTOR * lf * sim_speed)
+
+                # Closed-loop rate feedback correction
+                fb_effort = self.inner.compute(rate_err, dt)
+                total_effort = ff_effort + fb_effort
+                total_effort = float(np.clip(total_effort, -100.0, 100.0))
+
+                effort_mag = abs(total_effort)
+                if effort_mag > 0.2:
+                    raw_pwm = min(100.0, stall_pwm + effort_mag * (1.0 - stall_pwm / 100.0))
+                else:
+                    raw_pwm = 0.0
+
+                # Stall detector monitoring & boost
                 stalled, boost = self.stall.update(self.true_vel, raw_pwm)
                 eff_pwm = min(100.0, raw_pwm + boost)
                 self.pwm = eff_pwm
 
-                direction = math.copysign(1.0, self.vel_demand) if abs(self.vel_demand) > 0.01 else 0.0
+                motor_dir = math.copysign(1.0, total_effort) if effort_mag > 0.2 else 0.0
                 if eff_pwm > stall_pwm:
                     motor_force = K_MOTOR * (eff_pwm - stall_pwm) * lf * sim_speed
                 else:
                     motor_force = 0.0
 
                 friction = K_FRICTION * self.true_vel + STATIC_FRIC * math.copysign(1.0, self.true_vel) if abs(self.true_vel) > 0.01 else 0.0
-                accel = direction * motor_force - friction
+                accel = motor_dir * motor_force - friction
                 self.true_vel += accel * dt
                 self.true_angle += self.true_vel * dt
 
@@ -474,7 +560,7 @@ class AntennaSimulationManager:
         self.sim_time = 0.0
         self.running = False
         for ax, a in self.axes.items():
-            a.reset(initial_angle=45.0 if ax == 'elevation' else 0.0)
+            a.reset(initial_angle=0.0)
         self.clear_recorded_data()
 
     def set_motion_mode(self, mode: str):
@@ -567,7 +653,8 @@ class AntennaSimulationManager:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"sim_antenna_{ts}.csv"
 
-        filepath = os.path.abspath(filename)
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        filepath = os.path.join(LOGS_DIR, filename)  # bare names land in logs/, absolute paths are kept
         import pandas as pd
         df = pd.DataFrame(self.log_data)
         df.to_csv(filepath, index=False, float_format="%.6f")

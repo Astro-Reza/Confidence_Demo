@@ -1,6 +1,6 @@
-# Pipeline Simulasi Sensor Fusion (Berdasarkan `development.ipynb`)
+# Pipeline Simulasi Sensor Fusion (Berdasarkan `notebooks/fusion_development.ipynb`)
 
-Dokumen ini menjelaskan tahapan lengkap (*step-by-step*) metode simulasi dan algoritma **confidence-weighted quaternion fusion** untuk sistem penunjukan antena (*antenna pointing system*) berdasarkan percobaan yang ada di dalam *notebook* `development.ipynb`.
+Dokumen ini menjelaskan tahapan lengkap (*step-by-step*) metode simulasi dan algoritma **confidence-weighted quaternion fusion** untuk sistem penunjukan antena (*antenna pointing system*) berdasarkan percobaan yang ada di dalam *notebook* `notebooks/fusion_development.ipynb`.
 
 Pipeline ini berjalan melalui 5 tahap utama secara berurutan:
 

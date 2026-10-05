@@ -16,7 +16,7 @@ This project integrates real CAD STL kinematic meshes, dynamic motor plant dynam
 ### Accuracy Analysis Under Dynamic Fault Injection
 Below is the evaluation of tracking performance under mechanical drift ramp (orange zone, $t=8\text{s} - 14\text{s}$) and electrical glitch step offset (pink zone, $t=22\text{s} - 25\text{s}$):
 
-![Sensor Fusion Accuracy Analysis](output.png)
+![Sensor Fusion Accuracy Analysis](docs/images/fusion_accuracy.png)
 
 *Key Takeaways:*
 * **Encoder (Orange/Green)** suffers from severe drift and offset divergence ($>12^\circ$ error).
@@ -83,28 +83,37 @@ Instead of rigid constant-covariance Kalman filtering, the system dynamically ca
 
 ```plaintext
 .
-├── antenna_fusion_app.py         # Flagship 2-page unified 3D simulation & post-run inspector app
-├── antenna_sim_core.py           # Core simulation engine: FK kinematics, PID plant, quaternion fusion
-├── csv_viewer.py                 # Standalone interactive PyQt5 CSV time-series viewer
-├── csv_logger.py                 # Time-series CSV exporter utility
+├── antenna_fusion/               # Python package
+│   ├── core.py                   # Simulation engine: FK kinematics, PID plant, sensors, quaternion fusion
+│   ├── simulator_app.py          # Flagship 2-page 3D simulation & post-run inspector app
+│   ├── log_viewer.py             # Standalone interactive PyQt5 CSV time-series viewer
+│   ├── csv_export.py             # Time-series CSV exporter used by the notebook
+│   └── paths.py                  # Repository-relative asset / log locations
 │
-├── launch_sim.bat                # 1-Click Windows batch launcher for 3D Simulation
-├── launch_viewer.bat             # 1-Click Windows batch launcher for Standalone CSV Viewer
+├── assets/
+│   ├── cad/                      # STL meshes: azimuth_body, elevation_body, polarization_body
+│   └── img/                      # App icon and Palatine wordmark
 │
-├── CADs-Azimuth-Body.stl         # 3D CAD mesh for Azimuth link
-├── CADs-Elevation-Body.stl       # 3D CAD mesh for Elevation link & dish mount
-├── CADs-Polarization-Body.stl    # 3D CAD mesh for Polarization link & feed horn
+├── notebooks/
+│   └── fusion_development.ipynb  # R&D notebook (algorithm design & validation)
 │
-├── development.ipynb             # Research & development Jupyter notebook (algorithm design & validation)
-├── output.png                    # Exported accuracy analysis and error comparison plot
+├── data/
+│   └── sample_timeseries.csv     # Sample single-axis fusion run for the log viewer
 │
-├── docs/                         # Theoretical reference documentation
+├── docs/
 │   ├── kinematics.md             # Motor plant, friction, and kinematics equations
 │   ├── confidence.md             # Mathematical derivation of confidence-weighted fusion
-│   └── development.md            # Detailed step-by-step pipeline walkthrough
+│   ├── development.md            # Step-by-step pipeline walkthrough
+│   ├── design_system.md          # Palatine UI design system
+│   ├── code_analysis.md          # Technical review of the notebook & core engine
+│   └── images/                   # README / docs figures
 │
+├── logs/                         # Recorded simulation CSVs (created at runtime, gitignored)
+│
+├── run_simulator.bat             # 1-click Windows launcher for the 3D simulation
+├── run_log_viewer.bat            # 1-click Windows launcher for the CSV viewer
 ├── requirements.txt              # Python package dependencies
-└── .gitignore                    # Git ignore rules for bytecode, cache, and test logs
+└── .gitignore
 ```
 
 ---
@@ -133,23 +142,24 @@ pip install -r requirements.txt
 ### 2. Launching the Applications
 
 #### Option A: 1-Click Batch Launchers (Windows)
-* Double-click **`launch_sim.bat`** to start the full 3D simulation suite.
-* Double-click **`launch_viewer.bat`** to start the standalone CSV inspector.
+* Double-click **`run_simulator.bat`** to start the full 3D simulation suite.
+* Double-click **`run_log_viewer.bat`** to start the standalone CSV inspector.
 
 #### Option B: Terminal Commands
 ```bash
+# Run from the repository root
 # Launch the main 2-Page 3D Simulation Application
-python antenna_fusion_app.py
+python -m antenna_fusion            # same as: python -m antenna_fusion.simulator_app
 
 # Launch the standalone CSV Viewer (optionally pass a CSV file path)
-python csv_viewer.py
+python -m antenna_fusion.log_viewer
 # or
-python csv_viewer.py path/to/simulation_log.csv
+python -m antenna_fusion.log_viewer data/sample_timeseries.csv
 ```
 
 #### Option C: Explore the Development Notebook
 ```bash
-jupyter notebook development.ipynb
+jupyter notebook notebooks/fusion_development.ipynb
 ```
 
 ---
@@ -162,7 +172,7 @@ jupyter notebook development.ipynb
 3. **Fault Injection**:
    * Click **Inject Drift**: Forces a ramp offset on the encoder. Watch the encoder confidence plunge to near-zero as the filter shifts trust to the AHRS.
    * Click **Inject Glitch**: Injects an abrupt $+15^\circ$ jump. Notice the quaternion fusion completely ignores the glitch.
-4. **Recording**: Click **Start Recording** to log all multi-axis telemetry directly to a timestamped CSV.
+4. **Recording**: Click **Start Recording** to log all multi-axis telemetry to a timestamped CSV in `logs/`.
 
 ### Post-Run Analysis Page
 1. Open the **Analysis & Inspector** tab.
