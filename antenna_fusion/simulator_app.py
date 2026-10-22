@@ -89,6 +89,7 @@ SERIES = {
     'fused':  '#00D26A',   # series 1 — fused estimate (the nominal series)
     'enc':    '#D6001F',   # series 2 — encoder
     'ahrs':   '#7C4DFF',   # series 3 — AHRS
+    'ekf':    '#0047FF',   # series 4 — EKF baseline (comparison)
     'true':   PAL['text_1'],  # ground truth: neutral reference
     'target': PAL['text_3'],  # setpoint: faint dashed reference
 }
@@ -111,13 +112,14 @@ P2_PLOT_THEMES = {
 
 # Post-run analysis: panels, signals, and which curve lives where (legend order)
 P2_PANELS = [('angle', 'Angle'), ('confidence', 'Confidence'), ('error', 'Error')]
-P2_SIGNALS = ['true', 'target', 'enc', 'ahrs', 'fused']
+P2_SIGNALS = ['true', 'target', 'enc', 'ahrs', 'fused', 'ekf']
 P2_CURVES = [  # (curve key, legend name, panel, signal)
     ('target', 'target', 'angle', 'target'), ('true', 'true', 'angle', 'true'),
     ('enc', 'enc', 'angle', 'enc'), ('ahrs', 'ahrs', 'angle', 'ahrs'), ('fused', 'fused', 'angle', 'fused'),
+    ('ekf', 'ekf', 'angle', 'ekf'),
     ('conf_enc', 'c_enc', 'confidence', 'enc'), ('conf_ahrs', 'c_ahrs', 'confidence', 'ahrs'),
     ('err_enc', 'err_enc', 'error', 'enc'), ('err_ahrs', 'err_ahrs', 'error', 'ahrs'),
-    ('err_fused', 'err_fused', 'error', 'fused'),
+    ('err_fused', 'err_fused', 'error', 'fused'), ('err_ekf', 'err_ekf', 'error', 'ekf'),
 ]
 
 # Typography (design_system.md §4): two voices, never blended
@@ -662,6 +664,8 @@ class AntennaFusionApp(QMainWindow):
                 'err_enc': deque(maxlen=self.max_pts),
                 'err_ahrs': deque(maxlen=self.max_pts),
                 'err_fused': deque(maxlen=self.max_pts),
+                'ekf':     deque(maxlen=self.max_pts),
+                'err_ekf': deque(maxlen=self.max_pts),
             } for ax in AXES
         }
 
@@ -1420,6 +1424,14 @@ class AntennaFusionApp(QMainWindow):
             sel_row.addWidget(b)
             self.live_ax_btns[ax] = b
         sel_layout.addLayout(sel_row)
+        sel_layout.addSpacing(6)
+        self.btn_live_ekf = QPushButton("ekf")
+        self.btn_live_ekf.setCheckable(True)
+        self.btn_live_ekf.setChecked(True)
+        self.btn_live_ekf.setStyleSheet(self._segment_style(mono=True))
+        self.btn_live_ekf.setToolTip("Show / hide the EKF baseline in the angle and error plots")
+        self.btn_live_ekf.toggled.connect(self._on_live_ekf_toggled)
+        sel_layout.addWidget(self.btn_live_ekf)
         layout.addWidget(sel_bar)
 
         # PyQtGraph GraphicsLayoutWidget
@@ -1458,7 +1470,10 @@ class AntennaFusionApp(QMainWindow):
             'err_enc':   self.plt_live_err.plot(pen=sp('enc', 1.0, 170), name='err_enc'),
             'err_ahrs':  self.plt_live_err.plot(pen=sp('ahrs', 1.0, 170), name='err_ahrs'),
             'err_fused': self.plt_live_err.plot(pen=sp('fused', 2.0), name='err_fused'),
+            'ekf':       self.plt_live_ang.plot(pen=sp('ekf', 1.6), name='ekf'),
+            'err_ekf':   self.plt_live_err.plot(pen=sp('ekf', 1.6), name='err_ekf'),
         }
+        self.live_ekf_legends = {'ekf': lg_ang, 'err_ekf': lg_err}
         for lg in (lg_ang, lg_conf, lg_err):
             self._mono_legend(lg)
 
@@ -1713,6 +1728,7 @@ class AntennaFusionApp(QMainWindow):
             'enc': sp('enc', 1.0, 170), 'ahrs': sp('ahrs', 1.0, 170), 'fused': sp('fused', 2.0),
             'conf_enc': sp('enc', 1.6), 'conf_ahrs': sp('ahrs', 1.6),
             'err_enc': sp('enc', 1.0, 170), 'err_ahrs': sp('ahrs', 1.0, 170), 'err_fused': sp('fused', 2.0),
+            'ekf': sp('ekf', 1.6), 'err_ekf': sp('ekf', 1.6),
         }
         for key, name, panel, _signal in P2_CURVES:
             self.insp_curves[key] = self.p2_plots[panel].plot(pen=pens[key], name=name)
@@ -1935,8 +1951,11 @@ class AntennaFusionApp(QMainWindow):
         self.lbl_insp_enc = self._readout_row(il, 'enc')
         self.lbl_insp_ahrs = self._readout_row(il, 'ahrs')
         self.lbl_insp_fused = self._readout_row(il, 'fused')
+        self.lbl_insp_ekf = self._readout_row(il, 'ekf')
         il.addWidget(self._hairline())
         self.lbl_insp_conf = self._readout_row(il)
+        self.lbl_insp_noise = self._readout_row(il)
+        self.lbl_insp_fault = self._readout_row(il)
         self._clear_p2_inspector()
 
         layout.addWidget(insp_grp)
@@ -2025,12 +2044,17 @@ class AntennaFusionApp(QMainWindow):
         self.lbl_p2_rmse_enc = self._readout_row(sl, 'enc')
         self.lbl_p2_rmse_ahrs = self._readout_row(sl, 'ahrs')
         self.lbl_p2_rmse_fused = self._readout_row(sl, 'fused')
+        self.lbl_p2_rmse_ekf = self._readout_row(sl, 'ekf')
         sl.addWidget(self._hairline())
         self.lbl_p2_imp_enc = self._readout_row(sl)
         self.lbl_p2_imp_ahrs = self._readout_row(sl)
+        self.lbl_p2_ekf_vs_fused = self._readout_row(sl)
+        self.lbl_p2_ekf_vs_fused.setToolTip("RMSE reduction of the EKF relative to the confidence fusion "
+                                            "(positive = EKF more accurate)")
         for lbl, key in ((self.lbl_p2_rmse_enc, 'rmse_enc'), (self.lbl_p2_rmse_ahrs, 'rmse_ahrs'),
-                         (self.lbl_p2_rmse_fused, 'rmse_fused'), (self.lbl_p2_imp_enc, 'gain_vs_enc'),
-                         (self.lbl_p2_imp_ahrs, 'gain_vs_ahrs')):
+                         (self.lbl_p2_rmse_fused, 'rmse_fused'), (self.lbl_p2_rmse_ekf, 'rmse_ekf'),
+                         (self.lbl_p2_imp_enc, 'gain_vs_enc'), (self.lbl_p2_imp_ahrs, 'gain_vs_ahrs'),
+                         (self.lbl_p2_ekf_vs_fused, 'ekf_vs_fused')):
             lbl.setText(lbl.swatch + self._kv_html(key, "--", key_w=12))
 
         layout.addWidget(stat_grp)
@@ -2049,10 +2073,12 @@ class AntennaFusionApp(QMainWindow):
     def _clear_p2_inspector(self):
         self.lbl_insp_time.setText(self._kv_html("t", "---.---", "s"))
         for lbl, key in ((self.lbl_insp_true, 'true'), (self.lbl_insp_enc, 'enc'),
-                         (self.lbl_insp_ahrs, 'ahrs'), (self.lbl_insp_fused, 'fused')):
+                         (self.lbl_insp_ahrs, 'ahrs'), (self.lbl_insp_fused, 'fused'),
+                         (self.lbl_insp_ekf, 'ekf')):
             lbl.setText(lbl.swatch + self._kv_html(key, "---.--", "deg", key_w=6))
         self.lbl_insp_conf.setText(self._kv_html("c_enc", "--.-", "%") + "&nbsp;&nbsp;" +
                                    self._kv_html("c_ahrs", "--.-", "%"))
+        self._set_insp_settings(None)
 
     # ─────────────────────────────────────────────────────────────────────────
     # SIMULATION TICK & ANIMATION
@@ -2078,6 +2104,8 @@ class AntennaFusionApp(QMainWindow):
             b['err_enc'].append(a.enc_reading - a.true_angle)
             b['err_ahrs'].append(a.ahrs_reading - a.true_angle)
             b['err_fused'].append(a.fused_angle - a.true_angle)
+            b['ekf'].append(a.ekf_angle)
+            b['err_ekf'].append(a.ekf_angle - a.true_angle)
 
         # Advance top ribbon trajectory
         self.pipeline_ribbon.advance_step()
@@ -2132,6 +2160,23 @@ class AntennaFusionApp(QMainWindow):
         self.crv_live['err_enc'].setData(t, list(b['err_enc']))
         self.crv_live['err_ahrs'].setData(t, list(b['err_ahrs']))
         self.crv_live['err_fused'].setData(t, list(b['err_fused']))
+        if self.btn_live_ekf.isChecked():
+            self.crv_live['ekf'].setData(t, list(b['ekf']))
+            self.crv_live['err_ekf'].setData(t, list(b['err_ekf']))
+
+    def _on_live_ekf_toggled(self, on: bool):
+        """Show / hide the EKF baseline curves (and their legend entries) in the live plots."""
+        for key, lg in self.live_ekf_legends.items():
+            crv = self.crv_live[key]
+            crv.setVisible(on)
+            if on:
+                lg.addItem(crv, key)
+            else:
+                lg.removeItem(crv)
+            self._mono_legend(lg)
+        for plot in (self.plt_live_ang, self.plt_live_err):  # hidden curves no longer count toward the Y fit
+            plot.vb.updateAutoRange()
+        self._update_live_plots()
 
     def _update_live_status(self):
         for ax in AXES:
@@ -2289,6 +2334,7 @@ class AntennaFusionApp(QMainWindow):
         self.live_view_ax = axis
         for a, b in self.live_ax_btns.items():
             b.setChecked(a == axis)
+        self.cb_p2_axis.setCurrentText(axis)  # post-run analysis opens on the axis being watched
         self._refresh_mesh_materials()
         self._update_live_plots()
         self.diag_quad.update_telemetry(self.sim, self.live_view_ax)
@@ -2315,19 +2361,28 @@ class AntennaFusionApp(QMainWindow):
             self.btn_rec_toggle.setText("● Record CSV")
             csv_path = self.sim.stop_recording()
             n = len(self.sim.log_data)
+            if csv_path is None:  # stopped before any sample was logged
+                self._set_rec_status("EMPTY", 0)
+                self.status.showMessage("Recording stopped with no samples; nothing exported.")
+                return
             self._set_rec_status("SAVED", n, path=os.path.basename(csv_path))
             self.status.showMessage(f"Recorded data exported to {csv_path}")
 
     def _on_export_and_inspect(self):
         if self.sim.recording:
+            # setChecked() does not emit clicked, so run the stop handler directly (exports once)
             self.btn_rec_toggle.setChecked(False)
-            csv_path = self.sim.stop_recording()
-        else:
-            csv_path = self.sim.export_to_csv()
+            self._on_toggle_recording(False)
+        # Not recording: the last recording is already on disk; re-exporting log_data would
+        # write a duplicate CSV of that older run
+        csv_path = self.sim.current_csv_path
 
         if csv_path and os.path.exists(csv_path):
+            self.cb_p2_axis.setCurrentText(self.live_view_ax)
             self.tabs.setCurrentIndex(1)
             self._load_p2_csv(csv_path)
+        else:
+            self.status.showMessage("Nothing recorded yet. Press Record CSV first.")
 
     # ─────────────────────────────────────────────────────────────────────────
     # PAGE 2: CSV INSPECTION HANDLERS
@@ -2402,6 +2457,14 @@ class AntennaFusionApp(QMainWindow):
             e_ahrs = df['error_ahrs_deg'].values if 'error_ahrs_deg' in df.columns else th_ahrs - th_true
             e_fused = df['error_fused_deg'].values if 'error_fused_deg' in df.columns else th_fused - th_true
 
+        # EKF baseline (absent in recordings made before it was added)
+        ekf_col = f'{ax}_ekf' if f'{ax}_true' in df.columns else 'theta_ekf_deg'
+        if ekf_col in df.columns:
+            th_ekf = df[ekf_col].values
+            e_ekf = th_ekf - th_true
+        else:
+            th_ekf = e_ekf = None
+
         self.insp_curves['target'].setData(t, tgt)
         self.insp_curves['true'].setData(t, th_true)
         self.insp_curves['enc'].setData(t, th_enc)
@@ -2414,6 +2477,13 @@ class AntennaFusionApp(QMainWindow):
         self.insp_curves['err_enc'].setData(t, e_enc)
         self.insp_curves['err_ahrs'].setData(t, e_ahrs)
         self.insp_curves['err_fused'].setData(t, e_fused)
+
+        if th_ekf is not None:
+            self.insp_curves['ekf'].setData(t, th_ekf)
+            self.insp_curves['err_ekf'].setData(t, e_ekf)
+        else:
+            self.insp_curves['ekf'].setData([], [])
+            self.insp_curves['err_ekf'].setData([], [])
 
         self.insp_overview_crv.setData(t, th_fused)
         self.p2_overview.getPlotItem().setXRange(t[0], t[-1], padding=0)
@@ -2433,6 +2503,17 @@ class AntennaFusionApp(QMainWindow):
                               (self.lbl_p2_imp_ahrs, 'gain_vs_ahrs', rmse_ahrs)):
             if ref > 0:
                 lbl.setText(self._kv_html(key, f"{(1 - rmse_fused / ref) * 100:+7.1f}", "%", key_w=12))
+
+        # EKF baseline: its RMSE, and its error reduction relative to the confidence fusion
+        if e_ekf is not None:
+            rmse_ekf = np.sqrt(np.mean(e_ekf ** 2))
+            self.lbl_p2_rmse_ekf.setText(self.lbl_p2_rmse_ekf.swatch +
+                                         self._kv_html('rmse_ekf', f"{rmse_ekf:7.3f}", "deg", key_w=12))
+            vs = f"{(1 - rmse_ekf / rmse_fused) * 100:+7.1f}" if rmse_fused > 0 else "--"
+            self.lbl_p2_ekf_vs_fused.setText(self._kv_html('ekf_vs_fused', vs, "%", key_w=12))
+        else:
+            self.lbl_p2_rmse_ekf.setText(self.lbl_p2_rmse_ekf.swatch + self._kv_html('rmse_ekf', "--", key_w=12))
+            self.lbl_p2_ekf_vs_fused.setText(self._kv_html('ekf_vs_fused', "--", key_w=12))
 
     def _on_p2_region_changed(self):
         if self.insp_updating_region:
@@ -2507,6 +2588,8 @@ class AntennaFusionApp(QMainWindow):
             e_enc = row.get('error_enc_deg', th_enc - th_true)
             e_ahrs = row.get('error_ahrs_deg', th_ahrs - th_true)
             e_fused = row.get('error_fused_deg', th_fused - th_true)
+        ekf_col = f'{ax}_ekf' if f'{ax}_true' in self.insp_df.columns else 'theta_ekf_deg'
+        th_ekf = row.get(ekf_col)
 
         self.lbl_insp_time.setText(self._kv_html("t", f"{snapped_t:7.3f}", "s") +
                                    f"<span style=\"color:{PAL['text_3']}; font-size:10px;\">&nbsp;&nbsp;#{idx}</span>")
@@ -2518,8 +2601,25 @@ class AntennaFusionApp(QMainWindow):
             lbl.setText(lbl.swatch + self._kv_html(key, f"{val:+7.2f}", "deg", key_w=6) +
                         f"&nbsp;&nbsp;<span style=\"color:{PAL['text_3']};\">Δ</span>&nbsp;" +
                         value_html(f"{err:+6.2f}"))
+        if th_ekf is not None:
+            self.lbl_insp_ekf.setText(self.lbl_insp_ekf.swatch + self._kv_html("ekf", f"{th_ekf:+7.2f}", "deg", key_w=6) +
+                                      f"&nbsp;&nbsp;<span style=\"color:{PAL['text_3']};\">Δ</span>&nbsp;" +
+                                      value_html(f"{th_ekf - th_true:+6.2f}"))
+        else:
+            self.lbl_insp_ekf.setText(self.lbl_insp_ekf.swatch + self._kv_html("ekf", "---.--", "deg", key_w=6))
         self.lbl_insp_conf.setText(self._kv_html("c_enc", f"{c_enc * 100:5.1f}", "%") + "&nbsp;&nbsp;" +
                                    self._kv_html("c_ahrs", f"{c_ahrs * 100:5.1f}", "%"))
+        self._set_insp_settings(row, ax)
+
+    def _set_insp_settings(self, row, ax: str = None):
+        """Noise σ and injected faults at the cursor (absent in recordings made before they were logged)."""
+        def fmt(col, spec):
+            v = row.get(f'{ax}_{col}') if row is not None else None
+            return "--" if v is None or pd.isna(v) else format(v, spec)
+        self.lbl_insp_noise.setText(self._kv_html("sigma_enc", fmt('sigma_enc', '4.2f'), "deg") + "&nbsp;&nbsp;" +
+                                    self._kv_html("sigma_ahrs", fmt('sigma_ahrs', '4.2f'), "deg"))
+        self.lbl_insp_fault.setText(self._kv_html("drift", fmt('drift_offset', '+6.2f'), "deg") + "&nbsp;&nbsp;" +
+                                    self._kv_html("glitch", fmt('glitch_offset', '+6.2f'), "deg"))
 
     def _p2_set_window(self, start_s, end_s):
         if self.insp_df is None:

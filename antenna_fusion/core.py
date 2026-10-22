@@ -15,7 +15,8 @@ Implements:
    - Cross-sensor divergence trend filter and drift penalty
    - Inverse variance weighting and normalized confidence weights
    - Confidence-weighted quaternion fusion
-5. Real-Time Data Recording & Multi-Axis CSV Export
+5. Extended Kalman Filter baseline (angle, rate, encoder bias) run on the same readings for comparison
+6. Real-Time Data Recording & Multi-Axis CSV Export
 """
 
 import math
@@ -340,6 +341,70 @@ class ConfidenceFusionEngine:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EXTENDED KALMAN FILTER BASELINE (comparison against the confidence fusion)
+# ─────────────────────────────────────────────────────────────────────────────
+class EKFFusionEngine:
+    """
+    Causal EKF baseline from `notebooks/fusion_development.ipynb` (§5), one sample per update.
+      State       x = [θ, ω, b_enc]   (angle, angular rate, encoder bias)
+      Process     constant velocity, random-walk encoder bias
+      Measurement z = [θ + b_enc, θ]  (encoder, drift-free AHRS)
+    R uses the same sensor priors as the confidence fusion, so both methods see the same trust levels.
+    """
+    def __init__(self, dt: float = 0.02,
+                 sigma_prior_enc: float = 1.5, sigma_prior_ahrs: float = 1.2,
+                 q_acc: float = 1e4, q_bias: float = 10.0):
+        self.dt = dt
+        # q_acc is large on purpose: wall bounces and target steps reverse ω within one step
+        self.Q = np.array([[q_acc * dt**3 / 3, q_acc * dt**2 / 2, 0.0],
+                           [q_acc * dt**2 / 2, q_acc * dt,        0.0],
+                           [0.0,               0.0,               q_bias * dt]])
+        self.R = np.diag([sigma_prior_enc**2, sigma_prior_ahrs**2])
+        self.F = np.array([[1.0, dt, 0.0],
+                           [0.0, 1.0, 0.0],
+                           [0.0, 0.0, 1.0]])
+        self.H = np.array([[1.0, 0.0, 1.0],
+                           [1.0, 0.0, 0.0]])
+        self.P0 = np.diag([sigma_prior_ahrs**2, 50.0**2, 2.0**2])
+        self.reset()
+
+    def reset(self, initial_angle: float = 0.0):
+        self.x = np.array([initial_angle, 0.0, 0.0])
+        self.P = self.P0.copy()
+        self.initialized = False
+        self.angle = initial_angle
+        self.bias = 0.0
+        self.sigma = math.sqrt(self.P0[0, 0])
+
+    def update(self, theta_enc: float, theta_ahrs: float) -> tuple[float, float, float]:
+        """
+        Processes one sample of raw sensor readings.
+        Returns: (angle, encoder bias estimate, 1σ angle uncertainty)
+        """
+        if not self.initialized:
+            self.x = np.array([theta_ahrs, 0.0, 0.0])  # start at the drift-free sensor
+            self.initialized = True
+        else:
+            # Predict (f and h are linear for one axis, so the Jacobians are the constant F, H)
+            self.x = self.F @ self.x
+            self.P = self.F @ self.P @ self.F.T + self.Q
+
+        # Update
+        H = self.H
+        y = np.array([theta_enc, theta_ahrs]) - H @ self.x
+        S = H @ self.P @ H.T + self.R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        IKH = np.eye(3) - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ self.R @ K.T  # Joseph form: keeps P symmetric PSD
+
+        self.angle = float(self.x[0])
+        self.bias = float(self.x[2])
+        self.sigma = float(math.sqrt(max(self.P[0, 0], 0.0)))
+        return self.angle, self.bias, self.sigma
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AXIS SIMULATION MODEL (Physics, Motor, Sensors, and Fault Injection)
 # ─────────────────────────────────────────────────────────────────────────────
 class AxisSimulation:
@@ -399,6 +464,12 @@ class AxisSimulation:
         self.c_enc = 0.5
         self.c_ahrs = 0.5
 
+        # EKF baseline, run on the same sensor readings for comparison
+        self.ekf = EKFFusionEngine(dt=dt)
+        self.ekf_angle = 0.0
+        self.ekf_bias = 0.0
+        self.ekf_sigma = self.ekf.sigma
+
     def reset(self, initial_angle: float = 0.0):
         self.true_angle = initial_angle
         self.true_vel = 0.0
@@ -418,6 +489,11 @@ class AxisSimulation:
         self.fused_angle = initial_angle
         self.c_enc = 0.5
         self.c_ahrs = 0.5
+
+        self.ekf.reset(initial_angle)
+        self.ekf_angle = initial_angle
+        self.ekf_bias = 0.0
+        self.ekf_sigma = self.ekf.sigma
 
     def inject_drift_ramp(self, rate_deg_per_sec: float = 1.5):
         """Starts injecting continuous mechanical slip drift."""
@@ -535,6 +611,11 @@ class AxisSimulation:
             self.enc_reading, self.ahrs_reading, self.axis_vector
         )
 
+        # ── 4. EKF Baseline (same readings) ─────────────────────────────────
+        self.ekf_angle, self.ekf_bias, self.ekf_sigma = self.ekf.update(
+            self.enc_reading, self.ahrs_reading
+        )
+
         return self.fused_angle
 
 
@@ -620,6 +701,16 @@ class AntennaSimulationManager:
                 row[f'{ax}_err_enc'] = a.enc_reading - a.true_angle
                 row[f'{ax}_err_ahrs'] = a.ahrs_reading - a.true_angle
                 row[f'{ax}_err_fused'] = a.fused_angle - a.true_angle
+                row[f'{ax}_ekf'] = a.ekf_angle
+                row[f'{ax}_ekf_bias'] = a.ekf_bias
+                row[f'{ax}_ekf_sigma'] = a.ekf_sigma
+                row[f'{ax}_err_ekf'] = a.ekf_angle - a.true_angle
+                # Noise / fault settings in effect, so post-run analysis can explain the confidence
+                row[f'{ax}_sigma_enc'] = a.sigma_enc
+                row[f'{ax}_sigma_ahrs'] = a.sigma_ahrs
+                row[f'{ax}_drift_rate'] = a.drift_rate
+                row[f'{ax}_drift_offset'] = a.drift_offset
+                row[f'{ax}_glitch_offset'] = a.glitch_offset
 
             # Also provide single-axis legacy column names for the primary (azimuth) axis
             row['theta_true_deg'] = self.axes['azimuth'].true_angle
@@ -631,6 +722,8 @@ class AntennaSimulationManager:
             row['error_enc_deg'] = self.axes['azimuth'].enc_reading - self.axes['azimuth'].true_angle
             row['error_ahrs_deg'] = self.axes['azimuth'].ahrs_reading - self.axes['azimuth'].true_angle
             row['error_fused_deg'] = self.axes['azimuth'].fused_angle - self.axes['azimuth'].true_angle
+            row['theta_ekf_deg'] = self.axes['azimuth'].ekf_angle
+            row['error_ekf_deg'] = self.axes['azimuth'].ekf_angle - self.axes['azimuth'].true_angle
 
             self.log_data.append(row)
 
