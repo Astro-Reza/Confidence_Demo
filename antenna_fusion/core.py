@@ -17,6 +17,12 @@ Implements:
    - Confidence-weighted quaternion fusion
 5. Extended Kalman Filter baseline (angle, rate, encoder bias) run on the same readings for comparison
 6. Real-Time Data Recording & Multi-Axis CSV Export
+7. Virtual limit switches at both ends of each axis' operational range (AX_LIMITS)
+8. Startup limit-switch calibration: the antenna is installed with its azimuth limit seam on
+   true north (lo stop = 0 deg, hi stop = 360 deg), up to a small unknown installation error. It
+   drives every axis into both limit switches and reads the AHRS (world frame) at each stop to
+   verify its operational range and measure that error. Readings and targets are world angles;
+   azimuth stays continuous over the full lo..hi range, so it never wraps inside the range.
 """
 
 import math
@@ -59,6 +65,22 @@ AX_COLORS = {
     'polarization': '#fb923c',  # Amber/Orange
 }
 
+# Virtual limit switches at both ends of each axis' operational range
+LIMIT_SW_BAND = 0.25    # actuation zone inside the limit (°): switch closes once the axis is this close
+LIMIT_SW_HYST = 0.25    # release differential (°): switch reopens at BAND + HYST, so it can't chatter
+
+# Startup calibration
+INITIAL_POSE = {'azimuth': 180.0, 'elevation': 45.0, 'polarization': 90.0}  # mechanical angles at power-on (°)
+CAL_RATE  = {'azimuth': 45.0, 'elevation': 18.0, 'polarization': 30.0}      # slew toward a limit (°/s)
+CAL_CREEP = 3.0         # approach speed once the switch has closed, until the hard stop (°/s)
+CAL_DWELL = 50          # AHRS samples averaged at each stop (1 s at 50 Hz)
+MOUNT_TOL = 5.0         # installation error of the azimuth seam about true north (± deg)
+
+
+def wrap180(deg: float) -> float:
+    """Wrap an angle to [-180, 180)."""
+    return (deg + 180.0) % 360.0 - 180.0
+
 BASE_STALL  = 28.0      # stall PWM at 0° elevation
 K_MOTOR     = 0.060     # (°/s) per (PWM – stall) per load_factor (responsive slew response)
 K_FRICTION  = 0.22      # velocity-proportional friction
@@ -80,10 +102,14 @@ def apply_transform(pts: np.ndarray, m: np.ndarray) -> np.ndarray:
     return (m @ h.T).T[:, :3].astype(np.float32)
 
 
-def compute_fk_matrices(az_deg: float, el_deg: float, pol_deg: float) -> dict:
-    """Compute forward kinematics cumulative matrices for the 3-link antenna chain."""
+def compute_fk_matrices(az_deg: float, el_deg: float, pol_deg: float, mount_deg: float = 0.0) -> dict:
+    """
+    Compute forward kinematics cumulative matrices for the 3-link antenna chain.
+    Azimuth is a compass bearing (clockwise from north = +Y viewed from above), so the
+    rotation about +Z is negated. `mount_deg` is the world heading of the mechanical zero.
+    """
     m_az = transform_matrix(LINKS_CONFIG['azimuth']['pivot'],
-                            LINKS_CONFIG['azimuth']['axis'], az_deg)
+                            LINKS_CONFIG['azimuth']['axis'], -(az_deg + mount_deg))
     m_el = transform_matrix(LINKS_CONFIG['elevation']['pivot'],
                             LINKS_CONFIG['elevation']['axis'], el_deg)
     m_pol = transform_matrix(LINKS_CONFIG['polarization']['pivot'],
@@ -332,8 +358,11 @@ class ConfidenceFusionEngine:
                 q_fused /= norm
                 rot_fused = Rotation.from_quat(q_fused)
                 rotvec = rot_fused.as_rotvec()
-                # Projection along axis vector
-                self.fused_angle = float(np.degrees(np.dot(rotvec, axis_vector)))
+                # Projection along axis vector; as_rotvec() folds into (-180, 180], so unwrap
+                # onto the branch of the sensors (the axis can travel the full 0-360)
+                fused = float(np.degrees(np.dot(rotvec, axis_vector)))
+                ref = self.c_enc * theta_enc + self.c_ahrs * theta_ahrs
+                self.fused_angle = fused + 360.0 * round((ref - fused) / 360.0)
             else:
                 self.fused_angle = self.c_enc * theta_enc + self.c_ahrs * theta_ahrs
 
@@ -405,6 +434,43 @@ class EKFFusionEngine:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# VIRTUAL LIMIT SWITCH
+# ─────────────────────────────────────────────────────────────────────────────
+class LimitSwitch:
+    """
+    End-of-travel switch at one end of an axis' operational range.
+    Reads the true (mechanical) angle like a physical switch would, so it is immune
+    to sensor noise and encoder faults. Closes inside LIMIT_SW_BAND of the limit and
+    reopens only beyond LIMIT_SW_BAND + LIMIT_SW_HYST.
+    `hit` is True only on the step the switch closes (rising edge).
+    """
+    def __init__(self, limit_deg: float, side: str):
+        self.limit = limit_deg
+        self.side = side  # 'lo' | 'hi'
+        self.pressed = False
+        self.hit = False
+
+    def _depth(self, angle: float) -> float:
+        """Distance (°) still to travel before reaching the limit; <= 0 means at/past it."""
+        return angle - self.limit if self.side == 'lo' else self.limit - angle
+
+    def reset(self, angle: float):
+        # Starting on the switch counts as pressed, but not as a fresh hit
+        self.pressed = self._depth(angle) <= LIMIT_SW_BAND
+        self.hit = False
+
+    def update(self, angle: float) -> bool:
+        depth = self._depth(angle)
+        was = self.pressed
+        if depth <= LIMIT_SW_BAND:
+            self.pressed = True
+        elif depth > LIMIT_SW_BAND + LIMIT_SW_HYST:
+            self.pressed = False
+        self.hit = self.pressed and not was
+        return self.hit
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AXIS SIMULATION MODEL (Physics, Motor, Sensors, and Fault Injection)
 # ─────────────────────────────────────────────────────────────────────────────
 class AxisSimulation:
@@ -447,6 +513,21 @@ class AxisSimulation:
         self.roc_err = 0.0
         self.phase = 'IDLE'
 
+        # Limit switches at both ends of the operational range
+        lo, hi = self.limits
+        self.lim_lo = LimitSwitch(lo, 'lo')
+        self.lim_hi = LimitSwitch(hi, 'hi')
+        self.lim_lo.reset(self.true_angle)
+        self.lim_hi.reset(self.true_angle)
+
+        # Startup calibration (see begin_calibration)
+        self.world_offset = 0.0     # TRUE world heading of this axis' mechanical zero (hidden from the controller)
+        self.cal_phase = 'IDLE'     # IDLE | SEEK_LO | DWELL_LO | SEEK_HI | DWELL_HI | DONE
+        self.cal_samples = []
+        self.cal_world_lo = None    # AHRS world reading at the lo / hi stop
+        self.cal_world_hi = None
+        self.cal_offset = None      # estimated world offset of mechanical zero, set when DONE
+
         # Sensors & Faults
         self.sigma_enc = 0.50      # Encoder Gaussian noise σ (°)
         self.sigma_ahrs = 0.30     # AHRS Gaussian noise σ (°)
@@ -470,6 +551,22 @@ class AxisSimulation:
         self.ekf_bias = 0.0
         self.ekf_sigma = self.ekf.sigma
 
+        self.reset(INITIAL_POSE[name])
+
+    @property
+    def calibrating(self) -> bool:
+        return self.cal_phase not in ('IDLE', 'DONE')
+
+    @property
+    def calibrated(self) -> bool:
+        return self.cal_phase == 'DONE'
+
+    def begin_calibration(self):
+        """Forget any previous calibration and start seeking the lo limit switch."""
+        self.cal_phase = 'SEEK_LO'
+        self.cal_samples = []
+        self.cal_world_lo = self.cal_world_hi = self.cal_offset = None
+
     def reset(self, initial_angle: float = 0.0):
         self.true_angle = initial_angle
         self.true_vel = 0.0
@@ -478,6 +575,11 @@ class AxisSimulation:
         self.outer.reset()
         self.inner.reset()
         self.stall.reset()
+        self.cal_phase = 'IDLE'
+        self.cal_samples = []
+        self.cal_world_lo = self.cal_world_hi = self.cal_offset = None
+        self.lim_lo.reset(initial_angle)
+        self.lim_hi.reset(initial_angle)
 
         self.drift_rate = 0.0
         self.drift_offset = 0.0
@@ -509,12 +611,87 @@ class AxisSimulation:
         self.drift_offset = 0.0
         self.glitch_offset = 0.0
 
+    # ── Startup calibration ────────────────────────────────────────────────
+    def _step_calibration_motion(self):
+        """Slew into the current limit switch, creep onto the hard stop, then hold for the dwell."""
+        lo, hi = self.limits
+        if self.cal_phase in ('SEEK_LO', 'SEEK_HI'):
+            seek_lo = self.cal_phase == 'SEEK_LO'
+            sw = self.lim_lo if seek_lo else self.lim_hi
+            rate = CAL_CREEP if sw.pressed else CAL_RATE[self.name]
+            self.true_vel = -rate if seek_lo else rate
+            self.true_angle = float(np.clip(self.true_angle + self.true_vel * self.dt, lo, hi))
+            if self.true_angle in (lo, hi) and sw.pressed:
+                self.true_vel = 0.0
+                self.cal_samples = []
+                self.cal_phase = 'DWELL_LO' if seek_lo else 'DWELL_HI'
+        else:
+            self.true_vel = 0.0
+        self.phase = 'CAL'
+        self.pwm = self.vel_demand = self.roc_err = 0.0
+
+    def _mean_world(self, samples: list) -> float:
+        """Azimuth wraps at 360°, so it is averaged on the circle; the others linearly."""
+        if self.name == 'azimuth':
+            r = np.radians(samples)
+            return float(np.degrees(np.arctan2(np.mean(np.sin(r)), np.mean(np.cos(r)))) % 360.0)
+        return float(np.mean(samples))
+
+    def _finish_calibration_dwell(self):
+        world = self._mean_world(self.cal_samples)
+        self.cal_samples = []
+        if self.cal_phase == 'DWELL_LO':
+            self.cal_world_lo = world
+            self.cal_phase = 'SEEK_HI'
+            return
+
+        self.cal_world_hi = world
+        lo, hi = self.limits
+        offsets = [self.cal_world_lo - lo, self.cal_world_hi - hi]
+        if self.name == 'azimuth':
+            # Signed offset of the seam from north; the stops are then reported unwrapped (lo ~ 0, hi ~ 360)
+            offsets = [wrap180(o) for o in offsets]
+            self.cal_offset = wrap180(self._mean_world(offsets))
+            self.cal_world_lo, self.cal_world_hi = lo + offsets[0], hi + offsets[1]
+        else:
+            self.cal_offset = float(np.mean(offsets))
+        self.cal_phase = 'DONE'
+        # Hand over to the position loops from a clean state
+        self.outer.reset()
+        self.inner.reset()
+        self.stall.reset()
+
+    def world_to_mech(self, world_deg: float) -> float:
+        """Mechanical angle that points the axis at a world angle, using the calibrated offset."""
+        mech = world_deg - self.cal_offset
+        lo, hi = self.limits
+        if self.name == 'azimuth':
+            mech = (mech - lo) % 360.0 + lo
+        return float(np.clip(mech, lo, hi))
+
+    def target_world(self) -> float:
+        """Commanded world angle; NaN while calibrating, when the setpoint has no meaning yet."""
+        return float('nan') if self.calibrating else self.mech_to_world(self.target)
+
+    def mech_to_world(self, mech_deg: float) -> float:
+        """
+        World angle of a mechanical angle (azimuth: bearing from true north). Uses the
+        calibrated offset; until then the AHRS' own world-referenced heading stands in for it,
+        so readings stay continuous when calibration completes (the two agree to ~0.05 deg).
+        Not wrapped: the seam sits on north, so azimuth runs continuously from ~0 to ~360.
+        """
+        offset = self.world_offset if self.cal_offset is None else self.cal_offset
+        return mech_deg + offset
+
     def step(self, el_deg: float, sim_speed: float = 1.5):
         """Executes one simulation step for this axis."""
         dt = self.dt
 
         # ── 1. True Motion Update ──────────────────────────────────────────
-        if self.motion_mode == 'BROWNIAN':
+        if self.calibrating:
+            self._step_calibration_motion()
+
+        elif self.motion_mode == 'BROWNIAN':
             # Brownian motion with damping & reflective boundaries (fusion_development.ipynb)
             d_omega = random.gauss(0.0, self.brownian_sigma) * math.sqrt(dt) * sim_speed
             self.true_vel = self.true_vel * self.brownian_alpha + d_omega
@@ -598,6 +775,10 @@ class AxisSimulation:
                     self.true_angle = lo
                     self.true_vel = 0.0
 
+        # ── 1b. Limit Switches (mechanical position, not sensor readings) ───
+        self.lim_lo.update(self.true_angle)
+        self.lim_hi.update(self.true_angle)
+
         # ── 2. Sensor Readings (Gaussian Noise + Faults) ────────────────────
         self.drift_offset += self.drift_rate * dt
         total_encoder_error = self.drift_offset + self.glitch_offset + random.gauss(0.0, max(1e-4, self.sigma_enc))
@@ -605,6 +786,12 @@ class AxisSimulation:
 
         ahrs_noise = random.gauss(0.0, max(1e-4, self.sigma_ahrs))
         self.ahrs_reading = self.true_angle + ahrs_noise
+
+        # Calibration dwell: the AHRS reports the world-frame angle of the stop
+        if self.cal_phase in ('DWELL_LO', 'DWELL_HI'):
+            self.cal_samples.append(self.true_angle + self.world_offset + ahrs_noise)
+            if len(self.cal_samples) >= CAL_DWELL:
+                self._finish_calibration_dwell()
 
         # ── 3. Confidence-Weighted Sensor Fusion ────────────────────────────
         self.fused_angle, self.c_enc, self.c_ahrs = self.fusion.update(
@@ -633,16 +820,56 @@ class AntennaSimulationManager:
 
         self.axes = {ax: AxisSimulation(ax, dt=dt) for ax in AXES}
 
+        # Installation: world heading (from true north) of the azimuth mechanical zero.
+        # Unknown to the controller until calibration has found it.
+        self.mount_heading = 0.0
+        self.world_targets = {}          # last commanded world angles, re-applied after calibration
+        self.cal_just_done = False       # set for one step when the last axis finishes
+        self._cal_pending = set()        # axes still waiting to take their world target
+        self.start_calibration(new_mount=True)
+
         # Real-time recorded data buffers for CSV export
         self.log_data = []
         self.current_csv_path = None
 
     def reset(self):
+        """Power-cycle into a fresh installation: initial pose, new random mount heading, recalibrate."""
         self.sim_time = 0.0
         self.running = False
         for ax, a in self.axes.items():
-            a.reset(initial_angle=0.0)
+            a.reset(initial_angle=INITIAL_POSE[ax])
         self.clear_recorded_data()
+        self.start_calibration(new_mount=True)
+
+    def start_calibration(self, new_mount: bool = False, mount_heading: float = None):
+        """
+        Begin the limit-switch calibration from the current pose. A new mount models installing
+        the antenna with its seam on true north, off by a small random error; keep it for a
+        re-calibration in place.
+        """
+        if mount_heading is not None:
+            self.mount_heading = wrap180(float(mount_heading))
+        elif new_mount:
+            self.mount_heading = random.uniform(-MOUNT_TOL, MOUNT_TOL)
+        self.cal_just_done = False
+        self._cal_pending = set(self.axes)
+        for ax, a in self.axes.items():
+            a.world_offset = self.mount_heading if ax == 'azimuth' else 0.0
+            a.begin_calibration()
+
+    @property
+    def calibrating(self) -> bool:
+        return any(a.calibrating for a in self.axes.values())
+
+    @property
+    def calibrated(self) -> bool:
+        return all(a.calibrated for a in self.axes.values())
+
+    def set_world_target(self, axis_name: str, world_deg: float):
+        """Command an axis in world angles (azimuth = bearing from true north); applied once calibrated."""
+        self.world_targets[axis_name] = float(world_deg)
+        if self.axes[axis_name].calibrated:
+            self.set_target(axis_name, self.axes[axis_name].world_to_mech(world_deg))
 
     def set_motion_mode(self, mode: str):
         for a in self.axes.values():
@@ -682,26 +909,38 @@ class AntennaSimulationManager:
         self.sim_time += self.dt
         el_deg = self.axes['elevation'].true_angle
 
+        was_calibrating = self.calibrating
+
         # Step each axis
         for ax in AXES:
             self.axes[ax].step(el_deg, self.sim_speed)
+
+        # Each axis starts chasing its commanded world angle as soon as its own calibration finishes
+        for ax in list(self._cal_pending):
+            if self.axes[ax].calibrated:
+                self._cal_pending.discard(ax)
+                if ax in self.world_targets:
+                    self.set_world_target(ax, self.world_targets[ax])
+        self.cal_just_done = was_calibrating and not self.calibrating
 
         # Record sample if recording is active
         if self.recording:
             row = {'time_s': self.sim_time}
             for ax in AXES:
                 a = self.axes[ax]
-                row[f'{ax}_target'] = a.target
-                row[f'{ax}_true'] = a.true_angle
-                row[f'{ax}_enc'] = a.enc_reading
-                row[f'{ax}_ahrs'] = a.ahrs_reading
-                row[f'{ax}_fused'] = a.fused_angle
+                # Absolute angles in the world frame once calibrated; errors are frame-independent
+                w = a.mech_to_world
+                row[f'{ax}_target'] = a.target_world()
+                row[f'{ax}_true'] = w(a.true_angle)
+                row[f'{ax}_enc'] = w(a.enc_reading)
+                row[f'{ax}_ahrs'] = w(a.ahrs_reading)
+                row[f'{ax}_fused'] = w(a.fused_angle)
                 row[f'{ax}_c_enc'] = a.c_enc
                 row[f'{ax}_c_ahrs'] = a.c_ahrs
                 row[f'{ax}_err_enc'] = a.enc_reading - a.true_angle
                 row[f'{ax}_err_ahrs'] = a.ahrs_reading - a.true_angle
                 row[f'{ax}_err_fused'] = a.fused_angle - a.true_angle
-                row[f'{ax}_ekf'] = a.ekf_angle
+                row[f'{ax}_ekf'] = w(a.ekf_angle)
                 row[f'{ax}_ekf_bias'] = a.ekf_bias
                 row[f'{ax}_ekf_sigma'] = a.ekf_sigma
                 row[f'{ax}_err_ekf'] = a.ekf_angle - a.true_angle
@@ -711,18 +950,22 @@ class AntennaSimulationManager:
                 row[f'{ax}_drift_rate'] = a.drift_rate
                 row[f'{ax}_drift_offset'] = a.drift_offset
                 row[f'{ax}_glitch_offset'] = a.glitch_offset
+                row[f'{ax}_lim_lo'] = int(a.lim_lo.pressed)
+                row[f'{ax}_lim_hi'] = int(a.lim_hi.pressed)
+                row[f'{ax}_calibrating'] = int(a.calibrating)
 
             # Also provide single-axis legacy column names for the primary (azimuth) axis
-            row['theta_true_deg'] = self.axes['azimuth'].true_angle
-            row['theta_enc_deg'] = self.axes['azimuth'].enc_reading
-            row['theta_ahrs_deg'] = self.axes['azimuth'].ahrs_reading
-            row['theta_fused_deg'] = self.axes['azimuth'].fused_angle
+            az = self.axes['azimuth']
+            row['theta_true_deg'] = az.mech_to_world(az.true_angle)
+            row['theta_enc_deg'] = az.mech_to_world(az.enc_reading)
+            row['theta_ahrs_deg'] = az.mech_to_world(az.ahrs_reading)
+            row['theta_fused_deg'] = az.mech_to_world(az.fused_angle)
             row['conf_enc'] = self.axes['azimuth'].c_enc
             row['conf_ahrs'] = self.axes['azimuth'].c_ahrs
             row['error_enc_deg'] = self.axes['azimuth'].enc_reading - self.axes['azimuth'].true_angle
             row['error_ahrs_deg'] = self.axes['azimuth'].ahrs_reading - self.axes['azimuth'].true_angle
             row['error_fused_deg'] = self.axes['azimuth'].fused_angle - self.axes['azimuth'].true_angle
-            row['theta_ekf_deg'] = self.axes['azimuth'].ekf_angle
+            row['theta_ekf_deg'] = az.mech_to_world(az.ekf_angle)
             row['error_ekf_deg'] = self.axes['azimuth'].ekf_angle - self.axes['azimuth'].true_angle
 
             self.log_data.append(row)

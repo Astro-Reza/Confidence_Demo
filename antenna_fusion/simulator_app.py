@@ -28,6 +28,7 @@ Usage:
     python -m antenna_fusion.simulator_app      (or run_simulator.bat)
 """
 
+import math
 import os
 import sys
 import glob
@@ -668,6 +669,8 @@ class AntennaFusionApp(QMainWindow):
                 'err_ekf': deque(maxlen=self.max_pts),
             } for ax in AXES
         }
+        # Limit switch hits per axis: (time_s, limit_deg, side)
+        self.lim_events = {ax: deque(maxlen=64) for ax in AXES}
 
         # Page 2 Inspector state
         self.insp_df = None
@@ -679,6 +682,10 @@ class AntennaFusionApp(QMainWindow):
 
         # Exploded digital twin state
         self.is_exploded_view = True
+
+        # Calibration overlay in the 3D view (rebuilt when a limit reading arrives)
+        self._cal_vis_key = None
+        self.el_overlay = {}   # name -> (mesh, base points in the az = 0 frame)
 
         self._apply_global_stylesheet()
         self._build_main_ui()
@@ -692,6 +699,10 @@ class AntennaFusionApp(QMainWindow):
         self.sim_timer = QTimer()
         self.sim_timer.timeout.connect(self._on_sim_tick)
         self.sim_timer.start(20)
+
+        # Power-on: the antenna starts its limit-switch calibration straight away
+        self._on_start_sim()
+        self.status.showMessage("Power-on: calibrating against the limit switches to find true north and the axis ranges.")
 
     # ─────────────────────────────────────────────────────────────────────────
     # GLOBAL APPLICATION STYLESHEET (NO CSS FILTER / OPACITY WARNINGS)
@@ -990,7 +1001,9 @@ class AntennaFusionApp(QMainWindow):
             gt_l.addLayout(row_l)
             self.tgt_sliders[ax] = sl
             self.tgt_labels[ax] = lbl_val
-            self.sim.set_target(ax, dflt)
+            if ax == 'azimuth':
+                lbl_name.setToolTip("Bearing from true north; applied once the antenna is calibrated")
+            self.sim.set_world_target(ax, dflt)
 
         # Run / Stop / Reset
         btn_row = QHBoxLayout()
@@ -1010,6 +1023,27 @@ class AntennaFusionApp(QMainWindow):
         gt_l.addLayout(btn_row)
 
         layout.addWidget(grp_tgt)
+
+        # ── Group: Startup Calibration ─────────────────────────────────────
+        grp_cal = QGroupBox("Startup Calibration")
+        grp_cal.setStyleSheet(self._grp_style())
+        gc_l = QVBoxLayout(grp_cal)
+        gc_l.setSpacing(5)
+
+        self.lbl_cal = QLabel()
+        self.lbl_cal.setTextFormat(Qt.RichText)
+        self.lbl_cal.setStyleSheet(self._mono_qss(PAL['text_2'], 10))
+        gc_l.addWidget(self.lbl_cal)
+
+        self.btn_recal = QPushButton("⟳ Recalibrate")
+        self.btn_recal.setToolTip("Drive every axis into both limit switches again and re-measure the range")
+        self.btn_recal.setStyleSheet(self._action_btn_style())
+        self.btn_recal.clicked.connect(self._on_recalibrate)
+        gc_l.addWidget(self.btn_recal)
+
+        layout.addWidget(grp_cal)
+        self._cal_text = None
+        self._update_cal_panel()
 
         # ── Group 2: Telemetry Logging ─────────────────────────────────────
         grp_rec = QGroupBox("Telemetry Logging")
@@ -1219,6 +1253,9 @@ class AntennaFusionApp(QMainWindow):
         # Hairline projection line along the assembly axis
         self._add_3d_projection_lines()
 
+        # Compass rose on the ground: true north and the calibrated azimuth limit
+        self._add_3d_compass()
+
         # Small leader-line callouts showing each joint's live angle
         self._add_3d_angle_labels()
 
@@ -1240,6 +1277,100 @@ class AntennaFusionApp(QMainWindow):
             line, color=PAL['line_strong'], line_width=1.0,
             name='axis_projection_line'
         )
+
+    # ── Compass rose + calibrated limits (world frame: north = +Y, east = +X, bearings clockwise) ──
+    COMPASS_R = 300.0
+    COMPASS_Z = -30.0
+    EL_ARC_R = 300.0
+
+    @staticmethod
+    def _polyline(pts) -> pv.PolyData:
+        pts = np.asarray(pts, dtype=np.float32)
+        return pv.PolyData(pts, lines=np.hstack([[len(pts)], np.arange(len(pts))]).astype(np.int64))
+
+    @staticmethod
+    def _segments(pairs) -> pv.PolyData:
+        pts = np.asarray(pairs, dtype=np.float32).reshape(-1, 3)
+        lines = np.hstack([[[2, 2 * i, 2 * i + 1] for i in range(len(pts) // 2)]]).ravel()
+        return pv.PolyData(pts, lines=lines.astype(np.int64))
+
+    def _bearing_pt(self, bearing_deg: float, radius: float, z: float = None) -> np.ndarray:
+        b = math.radians(bearing_deg)
+        return np.array([radius * math.sin(b), radius * math.cos(b), self.COMPASS_Z if z is None else z])
+
+    def _add_3d_compass(self):
+        r = self.COMPASS_R
+        ring = self._polyline([self._bearing_pt(b, r) for b in range(0, 361, 3)])
+        self.plotter.add_mesh(ring, color=PAL['line_strong'], line_width=1.0, name='compass_ring')
+
+        ticks = []
+        for b in range(0, 360, 30):
+            ticks += [self._bearing_pt(b, r), self._bearing_pt(b, r * (0.92 if b % 90 else 0.86))]
+        self.plotter.add_mesh(self._segments(ticks), color=PAL['text_3'], line_width=1.0, name='compass_ticks')
+
+        north = pv.Arrow(start=self._bearing_pt(0, 0), direction=(0, 1, 0), scale=r * 1.08,
+                         tip_length=0.18, tip_radius=0.05, shaft_radius=0.012)
+        self.plotter.add_mesh(north, color=PAL['alarm'], name='true_north')
+
+        self.plotter.add_point_labels(
+            np.array([self._bearing_pt(b, r * 1.14) for b in (0, 90, 180, 270)]), ['N', 'E', 'S', 'W'],
+            font_size=12, text_color=PAL['text_2'], shape=None, show_points=False,
+            always_visible=True, name='compass_cardinals')
+
+    def _clear_3d_limits(self):
+        for name in ('az_lim_lo', 'az_lim_hi', 'az_lim_labels', 'el_arc', 'el_lim_lo', 'el_lim_hi', 'el_lim_labels'):
+            self.plotter.remove_actor(name, render=False)
+        self.el_overlay = {}
+
+    def _sync_3d_calibration(self):
+        """Draw each limit once the antenna has read it: azimuth seam on the compass, elevation arc on the antenna."""
+        sim = self.sim
+        key = tuple((a.cal_world_lo, a.cal_world_hi) for a in sim.axes.values())
+        if key == self._cal_vis_key:
+            return
+        self._cal_vis_key = key
+        self._clear_3d_limits()
+
+        r = self.COMPASS_R
+        az, el = sim.axes['azimuth'], sim.axes['elevation']
+        lo_col, hi_col = PAL['state_live'], PAL['warn']
+
+        # Azimuth: lo and hi stop are the same heading (cable-wrap seam); the sweep leaves it
+        # clockwise from the lo stop and arrives counter-clockwise at the hi stop
+        labels, label_pts = [], []
+        for name, world, col, sweep, text in (('az_lim_lo', az.cal_world_lo, lo_col, +1, 'LIM LO'),
+                                              ('az_lim_hi', az.cal_world_hi, hi_col, -1, 'LIM HI')):
+            if world is None:
+                continue
+            arc = self._polyline([self._bearing_pt(world + sweep * d, r * 1.03) for d in range(0, 31, 2)])
+            spoke = self._segments([self._bearing_pt(world, r * 0.45), self._bearing_pt(world, r * 1.08)])
+            self.plotter.add_mesh(arc + spoke, color=col, line_width=3.0, name=name, render=False)
+            label_pts.append(self._bearing_pt(world + sweep * 14, r * 1.26))
+            labels.append(f"{text} {world:.1f}")
+        if labels:
+            self.plotter.add_point_labels(
+                np.array(label_pts), labels, font_size=11, text_color=PAL['text_1'], shape=None,
+                show_points=False, always_visible=True, name='az_lim_labels', render=False)
+
+        # Elevation: arc between the measured stops, drawn in the vertical plane of the antenna
+        if el.cal_world_lo is not None and el.cal_world_hi is not None:
+            pivot, R = LINKS_CONFIG['elevation']['pivot'], self.EL_ARC_R
+
+            def at(e):
+                e = math.radians(e)
+                return pivot + R * np.array([0.0, math.cos(e), math.sin(e)])
+
+            pieces = {
+                'el_arc': self._polyline([at(e) for e in np.linspace(el.cal_world_lo, el.cal_world_hi, 30)]),
+                'el_lim_lo': pv.PolyData(np.array([at(el.cal_world_lo)], dtype=np.float32)),
+                'el_lim_hi': pv.PolyData(np.array([at(el.cal_world_hi)], dtype=np.float32)),
+            }
+            for name, mesh in pieces.items():
+                self.el_overlay[name] = (mesh, mesh.points.copy())
+            self.plotter.add_mesh(pieces['el_arc'], color=PAL['text_2'], line_width=1.5, name='el_arc', render=False)
+            for name, col in (('el_lim_lo', lo_col), ('el_lim_hi', hi_col)):
+                self.plotter.add_mesh(pieces[name], color=col, point_size=10, render_points_as_spheres=True,
+                                      name=name, render=False)
 
     # Callout offset (display px, y up) from each joint pivot to its angle label
     ANGLE_LABEL_OFFSETS = {
@@ -1401,6 +1532,18 @@ class AntennaFusionApp(QMainWindow):
             label.item.setFont(mono_font(10))
         legend.setColumnCount(max(1, len(legend.items)))
 
+    @staticmethod
+    def _limit_marker_item():
+        """Scatter for limit switch hits: ▲ upper limit, ▼ lower limit, drawn at the limit angle."""
+        item = pg.ScatterPlotItem(size=11, pen=pg.mkPen(PAL['bg'], width=1), brush=pg.mkBrush(PAL['warn']),
+                                  name='limit_sw')
+        item.setZValue(50)
+        return item
+
+    @staticmethod
+    def _limit_spots(events):
+        return [{'pos': (t, deg), 'symbol': 't1' if side == 'hi' else 't'} for t, deg, side in events]
+
     def _build_p1_live_plots(self):
         container = QWidget()
         container.setObjectName("plotsPanel")
@@ -1473,6 +1616,8 @@ class AntennaFusionApp(QMainWindow):
             'ekf':       self.plt_live_ang.plot(pen=sp('ekf', 1.6), name='ekf'),
             'err_ekf':   self.plt_live_err.plot(pen=sp('ekf', 1.6), name='err_ekf'),
         }
+        self.live_lim_marks = self._limit_marker_item()
+        self.plt_live_ang.addItem(self.live_lim_marks)
         self.live_ekf_legends = {'ekf': lg_ang, 'err_ekf': lg_err}
         for lg in (lg_ang, lg_conf, lg_err):
             self._mono_legend(lg)
@@ -1732,6 +1877,8 @@ class AntennaFusionApp(QMainWindow):
         }
         for key, name, panel, _signal in P2_CURVES:
             self.insp_curves[key] = self.p2_plots[panel].plot(pen=pens[key], name=name)
+        self.p2_lim_marks = self._limit_marker_item()
+        self.p2_ang.addItem(self.p2_lim_marks)
         self.p2_signal_on = {s: True for s in P2_SIGNALS}
         self._rebuild_p2_legends()
 
@@ -1901,6 +2048,8 @@ class AntennaFusionApp(QMainWindow):
             for key, name, pnl, sig in P2_CURVES:
                 if pnl == panel and self.p2_signal_on[sig]:
                     plot.legend.addItem(self.insp_curves[key], name)
+            if panel == 'angle' and self.p2_lim_marks.points().size:
+                plot.legend.addItem(self.p2_lim_marks, 'limit_sw')
             self._mono_legend(plot.legend)
 
     def eventFilter(self, obj, event):
@@ -2094,21 +2243,34 @@ class AntennaFusionApp(QMainWindow):
         for ax in AXES:
             a = self.sim.axes[ax]
             b = self.buf[ax]
-            b['target'].append(a.target)
-            b['true'].append(a.true_angle)
-            b['enc'].append(a.enc_reading)
-            b['ahrs'].append(a.ahrs_reading)
-            b['fused'].append(a.fused_angle)
+            w = a.mech_to_world  # absolute readings in the world frame (azimuth = bearing from true north)
+            b['target'].append(a.target_world())
+            b['true'].append(w(a.true_angle))
+            b['enc'].append(w(a.enc_reading))
+            b['ahrs'].append(w(a.ahrs_reading))
+            b['fused'].append(w(a.fused_angle))
             b['c_enc'].append(a.c_enc)
             b['c_ahrs'].append(a.c_ahrs)
             b['err_enc'].append(a.enc_reading - a.true_angle)
             b['err_ahrs'].append(a.ahrs_reading - a.true_angle)
             b['err_fused'].append(a.fused_angle - a.true_angle)
-            b['ekf'].append(a.ekf_angle)
+            b['ekf'].append(w(a.ekf_angle))
             b['err_ekf'].append(a.ekf_angle - a.true_angle)
+            for sw in (a.lim_lo, a.lim_hi):
+                if sw.hit:
+                    self.lim_events[ax].append((t, sw.limit, sw.side))
+                    self.status.showMessage(f"Limit switch hit: {ax} {sw.side.upper()} ({sw.limit:.0f} deg) at t = {t:.2f} s")
 
         # Advance top ribbon trajectory
         self.pipeline_ribbon.advance_step()
+
+        self._update_cal_panel()
+        if self.sim.cal_just_done:
+            az = self.sim.axes['azimuth']
+            self.status.showMessage(
+                f"Calibration complete: azimuth range {az.cal_world_lo:.2f}..{az.cal_world_hi:.2f} deg, "
+                f"seam {az.cal_offset:+.2f} deg from true north (installed {self.sim.mount_heading:+.2f}). "
+                f"Targets are now bearings from true north.")
 
         self._update_3d_antenna()
         self._update_live_plots()
@@ -2118,11 +2280,20 @@ class AntennaFusionApp(QMainWindow):
         self.diag_quad.update_telemetry(self.sim, self.live_view_ax)
 
     def _update_3d_antenna(self):
+        self._sync_3d_calibration()
         fk = compute_fk_matrices(
             self.sim.axes['azimuth'].true_angle,
             self.sim.axes['elevation'].true_angle,
-            self.sim.axes['polarization'].true_angle
+            self.sim.axes['polarization'].true_angle,
+            self.sim.mount_heading
         )
+        # Elevation range arc rides on the azimuth stage
+        for mesh, base in self.el_overlay.values():
+            pts = apply_transform(base, fk['azimuth'])
+            if self.is_exploded_view:
+                pts = pts + self.layer_offsets['elevation']
+            mesh.points[:] = pts
+
         for name in AXES:
             # Apply kinematic forward transformation
             pts = apply_transform(self.orig_pts[name], fk[name])
@@ -2138,9 +2309,21 @@ class AntennaFusionApp(QMainWindow):
                 if self.is_exploded_view:
                     anchor = anchor + self.layer_offsets[name]
                 lbl['anchor'] = anchor.astype(float)
-                lbl['value'].SetInput(f"{self.sim.axes[name].true_angle:.1f}")
+                a = self.sim.axes[name]
+                if name == 'azimuth':  # a bearing from true north, only known once calibrated
+                    lbl['value'].SetInput(f"{a.mech_to_world(a.true_angle):.1f}" if a.calibrated else "--")
+                else:
+                    lbl['value'].SetInput(f"{a.mech_to_world(a.true_angle):.1f}")
 
         self.plotter.update()
+
+    @staticmethod
+    def _break_wraps(y) -> np.ndarray:
+        """NaN at a 360 -> 0 bearing wrap so the trace shows a gap, not a vertical stroke."""
+        y = np.array(y, dtype=float)
+        if len(y) > 1:
+            y[1:][np.abs(np.diff(y)) > 180.0] = np.nan
+        return y
 
     def _update_live_plots(self):
         if not self.t_buf:
@@ -2148,11 +2331,8 @@ class AntennaFusionApp(QMainWindow):
         t = list(self.t_buf)
         b = self.buf[self.live_view_ax]
 
-        self.crv_live['target'].setData(t, list(b['target']))
-        self.crv_live['true'].setData(t, list(b['true']))
-        self.crv_live['enc'].setData(t, list(b['enc']))
-        self.crv_live['ahrs'].setData(t, list(b['ahrs']))
-        self.crv_live['fused'].setData(t, list(b['fused']))
+        for key in ('target', 'true', 'enc', 'ahrs', 'fused'):
+            self.crv_live[key].setData(t, self._break_wraps(b[key]), connect='finite')
 
         self.crv_live['c_enc'].setData(t, list(b['c_enc']))
         self.crv_live['c_ahrs'].setData(t, list(b['c_ahrs']))
@@ -2161,8 +2341,12 @@ class AntennaFusionApp(QMainWindow):
         self.crv_live['err_ahrs'].setData(t, list(b['err_ahrs']))
         self.crv_live['err_fused'].setData(t, list(b['err_fused']))
         if self.btn_live_ekf.isChecked():
-            self.crv_live['ekf'].setData(t, list(b['ekf']))
+            self.crv_live['ekf'].setData(t, self._break_wraps(b['ekf']), connect='finite')
             self.crv_live['err_ekf'].setData(t, list(b['err_ekf']))
+
+        # Only hits still inside the scrolling window
+        visible = [e for e in self.lim_events[self.live_view_ax] if e[0] >= t[0]]
+        self.live_lim_marks.setData(self._limit_spots(visible))
 
     def _on_live_ekf_toggled(self, on: bool):
         """Show / hide the EKF baseline curves (and their legend entries) in the live plots."""
@@ -2182,7 +2366,8 @@ class AntennaFusionApp(QMainWindow):
         for ax in AXES:
             a = self.sim.axes[ax]
             self.live_status_lbls[ax].setText(self._bus_row(
-                ax, f"{a.true_angle:6.1f}", f"{a.fused_angle:6.1f}", f"{a.fused_angle - a.true_angle:+6.2f}",
+                ax, f"{a.mech_to_world(a.true_angle):6.1f}", f"{a.mech_to_world(a.fused_angle):6.1f}",
+                f"{a.fused_angle - a.true_angle:+6.2f}",
                 values_color=PAL['text_1']))
 
         va = self.live_view_ax
@@ -2195,11 +2380,15 @@ class AntennaFusionApp(QMainWindow):
 
         # Update Callout Overlay Floating Badge
         status_txt = "NOMINAL"
-        if a_v.drift_rate > 0:
+        if a_v.calibrating:
+            status_txt = "CALIBRATING"
+        elif a_v.lim_hi.pressed or a_v.lim_lo.pressed:
+            status_txt = f"LIMIT SW {'HI' if a_v.lim_hi.pressed else 'LO'}"
+        elif a_v.drift_rate > 0:
             status_txt = "DRIFT ACTIVE"
         elif abs(a_v.glitch_offset) > 0.1:
             status_txt = "GLITCH SPIKE"
-        self.callout_overlay.update_badge(va, a_v.fused_angle, a_v.c_enc, a_v.c_ahrs, status_txt)
+        self.callout_overlay.update_badge(va, a_v.mech_to_world(a_v.fused_angle), a_v.c_enc, a_v.c_ahrs, status_txt)
 
         if self.sim.recording:
             n = len(self.sim.log_data)
@@ -2221,6 +2410,38 @@ class AntennaFusionApp(QMainWindow):
         self.pipeline_ribbon.set_running(False)
         self.status.showMessage("Simulation paused.")
 
+    CAL_WORDS = {'IDLE': 'IDLE', 'SEEK_LO': 'SEEK LO', 'DWELL_LO': 'READ LO',
+                 'SEEK_HI': 'SEEK HI', 'DWELL_HI': 'READ HI', 'DONE': 'DONE'}
+
+    def _update_cal_panel(self):
+        """Per-axis calibration progress and the measured world range."""
+        rows = []
+        for ax in AXES:
+            a = self.sim.axes[ax]
+            state = 'warn' if a.calibrating else ('live' if a.calibrated else 'idle')
+            color = {'warn': PAL['warn'], 'live': PAL['state_live'], 'idle': PAL['text_3']}[state]
+            if a.calibrated:
+                rng = f"{round(a.cal_world_lo, 1) + 0.0:5.1f}..{round(a.cal_world_hi, 1):5.1f}"
+            else:
+                rng = "--"
+            rows.append(f"<span style=\"color:{PAL['text_3']};\">{ax[:3]}</span>&nbsp;"
+                        f"<span style=\"color:{color};\">{self.CAL_WORDS[a.cal_phase].replace(' ', '&nbsp;')}</span>" +
+                        "&nbsp;" * (8 - len(self.CAL_WORDS[a.cal_phase])) +
+                        f"&nbsp;{rng}")
+        az = self.sim.axes['azimuth']
+        north = (f"{az.cal_offset:6.2f}" if az.calibrated else "  --  ")
+        rows.append(f"<span style=\"color:{PAL['text_3']};\">north offset</span>&nbsp;{value_html(north, 'deg')}")
+        text = "<br>".join(rows)
+        if text != self._cal_text:
+            self._cal_text = text
+            self.lbl_cal.setText(text)
+
+    def _on_recalibrate(self):
+        self.sim.start_calibration()
+        self._update_cal_panel()
+        self._on_start_sim()
+        self.status.showMessage("Recalibrating: driving every axis into its limit switches.")
+
     def _on_reset_sim(self):
         self.sim.running = False
         self.btn_start.setChecked(False)
@@ -2232,6 +2453,9 @@ class AntennaFusionApp(QMainWindow):
                 q.clear()
         for crv in self.crv_live.values():
             crv.setData([], [])
+        for ev in self.lim_events.values():
+            ev.clear()
+        self.live_lim_marks.clear()
 
         # Reset motion mode
         self.rb_mode_target.setChecked(True)
@@ -2246,7 +2470,7 @@ class AntennaFusionApp(QMainWindow):
                 self.tgt_sliders[ax].blockSignals(False)
             if ax in self.tgt_labels:
                 self.tgt_labels[ax].setText(value_html(f"{dflt:3d}", "deg"))
-            self.sim.set_target(ax, float(dflt))
+            self.sim.set_world_target(ax, float(dflt))
 
         # Reset sensor noise sliders and clear faults
         self.sl_noise_enc.blockSignals(True)
@@ -2281,7 +2505,8 @@ class AntennaFusionApp(QMainWindow):
         # Reset diagnostic quad, HUD callout, and status
         self.diag_quad.update_telemetry(self.sim, self.live_view_ax)
         self._update_live_status()
-        self.status.showMessage("Simulation reset to initial state.")
+        self._update_cal_panel()
+        self.status.showMessage("Simulation reset: antenna re-installed at a new random heading. Press Start to calibrate.")
 
     def _on_motion_mode_changed(self):
         mode = 'TARGET' if self.rb_mode_target.isChecked() else 'BROWNIAN'
@@ -2290,7 +2515,7 @@ class AntennaFusionApp(QMainWindow):
 
     def _on_target_slider(self, axis, value, label):
         label.setText(value_html(f"{value:3d}", "deg"))
-        self.sim.set_target(axis, float(value))
+        self.sim.set_world_target(axis, float(value))
 
     def _on_fault_axis_changed(self, text):
         # Combo items are the axis identifiers themselves (plus "all")
@@ -2461,15 +2686,13 @@ class AntennaFusionApp(QMainWindow):
         ekf_col = f'{ax}_ekf' if f'{ax}_true' in df.columns else 'theta_ekf_deg'
         if ekf_col in df.columns:
             th_ekf = df[ekf_col].values
-            e_ekf = th_ekf - th_true
+            err_col = f'{ax}_err_ekf' if f'{ax}_true' in df.columns else 'error_ekf_deg'
+            e_ekf = df[err_col].values if err_col in df.columns else th_ekf - th_true
         else:
             th_ekf = e_ekf = None
 
-        self.insp_curves['target'].setData(t, tgt)
-        self.insp_curves['true'].setData(t, th_true)
-        self.insp_curves['enc'].setData(t, th_enc)
-        self.insp_curves['ahrs'].setData(t, th_ahrs)
-        self.insp_curves['fused'].setData(t, th_fused)
+        for key, y in (('target', tgt), ('true', th_true), ('enc', th_enc), ('ahrs', th_ahrs), ('fused', th_fused)):
+            self.insp_curves[key].setData(t, self._break_wraps(y), connect='finite')
 
         self.insp_curves['conf_enc'].setData(t, c_enc)
         self.insp_curves['conf_ahrs'].setData(t, c_ahrs)
@@ -2479,13 +2702,24 @@ class AntennaFusionApp(QMainWindow):
         self.insp_curves['err_fused'].setData(t, e_fused)
 
         if th_ekf is not None:
-            self.insp_curves['ekf'].setData(t, th_ekf)
+            self.insp_curves['ekf'].setData(t, self._break_wraps(th_ekf), connect='finite')
             self.insp_curves['err_ekf'].setData(t, e_ekf)
         else:
             self.insp_curves['ekf'].setData([], [])
             self.insp_curves['err_ekf'].setData([], [])
 
-        self.insp_overview_crv.setData(t, th_fused)
+        # Limit switch hits = rising edges of the recorded switch states (absent in older recordings)
+        events = []
+        for side, deg in zip(('lo', 'hi'), AX_LIMITS[ax]):
+            col = f'{ax}_lim_{side}'
+            if col in df.columns:
+                state = df[col].values.astype(bool)
+                rising = np.flatnonzero(state[1:] & ~state[:-1]) + 1
+                events += [(t[i], deg, side) for i in rising]
+        self.p2_lim_marks.setData(self._limit_spots(events))
+        self._rebuild_p2_legends()
+
+        self.insp_overview_crv.setData(t, self._break_wraps(th_fused), connect='finite')
         self.p2_overview.getPlotItem().setXRange(t[0], t[-1], padding=0)
 
         # Update Quality Assessment Statistics
